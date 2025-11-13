@@ -14,6 +14,7 @@ from compressed_tensors.quantization import (
     is_preset_scheme,
     preset_name_to_scheme,
 )
+from compressed_tensors.utils.match import match_named_modules
 from pydantic import Field, PrivateAttr, field_validator
 from torch.utils.hooks import RemovableHandle
 
@@ -23,9 +24,12 @@ from llmcompressor.modifiers.quantization.calibration import (
     calibrate_kv_cache_input_hook,
     calibrate_kv_cache_output_hook,
     calibrate_output_hook,
+    calibrate_ssm_state_input_hook,
+    calibrate_ssm_state_output_hook,
     freeze_module_quantization,
     initialize_observer,
     initialize_quantized_kv_cache,
+    initialize_quantized_ssm_state_cache,
     reset_quantization_status,
 )
 from llmcompressor.modifiers.utils.hooks import HooksMixin
@@ -78,6 +82,8 @@ class QuantizationMixin(HooksMixin):
         There is an explicit assumption that the model contains modules with
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
+    :param ssm_state_scheme: optional QuantizationArgs, similar to KV cache but for
+        state space model architectures, such as mamba and hybrid ssm like granite.
     """
 
     config_groups: Optional[Dict[str, QuantizationScheme]] = None
@@ -85,6 +91,7 @@ class QuantizationMixin(HooksMixin):
     ignore: List[str] = Field(default_factory=list)
     scheme: Optional[Union[str, Dict[str, Any]]] = None
     kv_cache_scheme: Optional[QuantizationArgs] = None
+    ssm_state_scheme: Optional[QuantizationArgs] = None
 
     _calibration_hooks: Set[RemovableHandle] = PrivateAttr(default_factory=set)
 
@@ -125,6 +132,25 @@ class QuantizationMixin(HooksMixin):
 
         # apply scheme and status to model
         config = self.resolve_quantization_config()
+        # NOTE apply_quant_cfg() has 2 jobs: identify the target modules based on config
+        # and then 1) attach quant_scheme and 2) init module, which adds _scales/_zp or
+        # kv_scales (as Parameters), and quant_status.
+        # Instead of adding/updating functions in compressed_tensors, we simply handles
+        # the missing parts corresponding to ssm_states here.
+
+        #       weight" here as a temp solution.
+        # init, dtype of scale/zp for mamba modules will be
+        #       inferred from .weight, but mamba module typically doesn't have weight.
+        #       
+        # _initialize_attn_scales and _initialize_scale_zero_point
+        if self.ssm_state_scheme is not None:
+            targets = config.config_groups["ssm_state"].targets
+            for name, submodule in match_named_modules(
+                model, targets, config.ignore, warn_on_fail=True
+                ):
+                _param = next(submodule.parameters())
+                submodule.weight = torch.tensor(1.0, dtype=_param.dtype, device=_param.device)
+                # need to init scales/zp for this module
         apply_quantization_config(model, config)
 
         # apply observers, disable quantization until calibration
@@ -163,6 +189,7 @@ class QuantizationMixin(HooksMixin):
             and self.ignore == []
             and self.scheme is None
             and self.kv_cache_scheme is None
+            and self.ssm_state_scheme is None
         )
 
     def resolve_quantization_config(self) -> QuantizationConfig:
@@ -173,6 +200,7 @@ class QuantizationMixin(HooksMixin):
         targets = self.targets
         config_groups = self.config_groups
         kv_cache_scheme = self.kv_cache_scheme
+        ssm_state_scheme = self.ssm_state_scheme
         ignore = self.ignore
 
         if scheme is not None and config_groups is not None:
@@ -200,6 +228,16 @@ class QuantizationMixin(HooksMixin):
         if config_groups is None or len(config_groups) == 0:
             default_quant_scheme = QuantizationScheme(targets=targets)
             config_groups = {"group_0": default_quant_scheme}
+
+        # Instead of updating compressed_tensors's QuantizationConfig and add a new func
+        # similar to process_kv_cache_config() (see .quantization.lifecycle.apply.py),
+        # it may be cleaner to directly parse ssm_state scheme here.
+        # TODO yaml/text-style recipe may not work this way.
+        if isinstance(ssm_state_scheme, QuantizationArgs):
+            config_groups["ssm_state"] = QuantizationScheme(
+                output_activations=ssm_state_scheme,
+                targets=["re:.*mamba$"],
+            )
 
         return QuantizationConfig(
             config_groups=config_groups,
@@ -233,6 +271,10 @@ class QuantizationMixin(HooksMixin):
         # modified to use attention output quantization if a kv_cache_scheme exists
         if is_attention and output:
             initialize_quantized_kv_cache(module)
+
+        # mamba ssm_state cache
+        elif "mamba" in str(module).lower() and output:
+            initialize_quantized_ssm_state_cache(module)
 
         # output activations
         elif output:
@@ -272,6 +314,28 @@ class QuantizationMixin(HooksMixin):
                 hooks.add(
                     self.register_hook(
                         module, calibrate_kv_cache_output_hook, "forward"
+                    )
+                )
+
+            # mamba ssm_state cache, similar to kv cache, only need fwd_pre_hook
+            elif "mamba" in str(module).lower() and output:
+                # attach original GraniteMoeHybridConfig to module for later use
+                module.model_cfg = model.config
+
+                hooks.add(
+                    self.register_hook(
+                        module,
+                        calibrate_ssm_state_input_hook,
+                        "forward_pre",
+                        with_kwargs=True,
+                    )
+                )
+                hooks.add(
+                    self.register_hook(
+                        module,
+                        calibrate_ssm_state_output_hook,
+                        "forward",
+                        with_kwargs=True,
                     )
                 )
 

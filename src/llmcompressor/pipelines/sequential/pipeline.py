@@ -13,8 +13,10 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
 from llmcompressor.pipelines.sequential.helpers import (
     dispatch_for_sequential,
+    fake_trace,
     get_sequential_targets,
     trace_subgraphs,
+    cache_block0,
 )
 from llmcompressor.utils.helpers import DisableQuantization, calibration_forward_context
 
@@ -115,6 +117,106 @@ class SequentialPipeline(CalibrationPipeline):
                             if subgraph_index < num_subgraphs - 1:
                                 activations.update(batch_idx, output)
                                 activations.delete(batch_idx, subgraph.consumed_names)
+
+            # redundant, finish any remaining compression
+            LifecycleCallbacks.calibration_epoch_end()
+
+
+@CalibrationPipeline.register("sequential-no-trace")
+class SequentialPipelineNoTrace(CalibrationPipeline):
+    """
+    The tracing mechanism employed in the original sequential pipeline is outdated and
+    could be upgraded to torch._dynamo. Alternatively, for typical transformers, one may
+    bypass tracing and use decoder blocks/modules as the "subgraph" directly.
+
+    Some minor adjustments needed compared to the original SequentialPipeline:
+     1. need to cache the inputs to block 0, as opposed to caching the input tokens
+        before embedding.
+     2. To be safe and generic, the correct call sequence of the target modules will be
+        determined by hooks and a sample input. Input/output shapes will also be
+        verified in this process.
+        TODO This Step 2 may be over-cautious and can be skipped if tested more. As
+        the decoder blocks in transformers are almost always structured as a ModuleList
+        called by the sequence in the list. What we intended to achieve here could be as
+        simple as identifying that ModuleList. 
+    """
+    @staticmethod
+    def __call__(
+        model: torch.nn.Module,
+        dataloader: DataLoader,
+        dataset_args: "DatasetArguments",
+    ):
+        session = active_session()
+
+        # prepare model for sequential onloading
+        dispatch_for_sequential(model)
+        model_device = get_execution_device(model)
+
+        # prepare to trace subgraphs
+        modifiers = session.lifecycle.recipe.modifiers
+        sequential_targets = get_sequential_targets(modifiers, model, dataset_args)
+
+        ignore = dataset_args.tracing_ignore
+
+        # "trace" subgraphs, should result in decoder blocks
+        sample_input = next(iter(dataloader))
+        subgraphs = fake_trace(model, sample_input, sequential_targets)
+        num_subgraphs = len(subgraphs)
+
+        LifecycleCallbacks.calibration_epoch_start()
+
+        # TODO: remove this to enable quantization aware calibration for GPTQ and AWQ
+        disable_qac = any(
+            type(mod).__name__ in ["GPTQModifier", "AWQModifier"]
+            for mod in session.lifecycle.recipe.modifiers
+        )
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(calibration_forward_context(model))
+            # Optionally disable quantization
+            if not dataset_args.quantization_aware_calibration or disable_qac:
+                stack.enter_context(DisableQuantization(model))
+
+            if dataset_args.calibrate_moe_context:
+                moe_calibration_context(model, stack)
+
+            # prepare intermediates cache (i.e. model input)
+            activations = IntermediatesCache.from_dataloader(dataloader, model_device)
+            # prepare block 0 input (i.e. embeddings), will force stop before module.fwd
+            block0 = model.get_submodule(subgraphs[0])
+            cache_block0(model, block0, activations)
+
+            for subgraph_index, subgraph_name in enumerate(subgraphs):
+                subgraph = model.get_submodule(subgraph_name)
+                # prepare tqdm description texts
+                calib_desc = f"({subgraph_index + 1}/{num_subgraphs}): Calibrating"
+                prop_desc = f"({subgraph_index + 1}/{num_subgraphs}): Propagating"
+
+                # reduce memory movement by keeping modules onloaded
+                with disable_offloading():
+                    # do a preliminary pass to trigger modifier hooks
+                    for batch_idx in tqdm(range(len(dataloader)), desc=calib_desc):
+                        inputs = activations.fetch(batch_idx)
+                        args = inputs.pop("positional_args", ())
+                        subgraph(*args, **inputs)
+
+                    LifecycleCallbacks.sequential_epoch_end()
+
+                    # this pass does not trigger modifier hooks
+                    # and is only used for capturing outputs of newly compressed modules
+                    with HooksMixin.disable_hooks():
+                        for batch_idx in tqdm(range(len(dataloader)), desc=prop_desc):
+                            inputs = activations.fetch(batch_idx)
+                            args = inputs.pop("positional_args", ())
+                            output = subgraph(*args, **inputs)
+                            if not isinstance(output, tuple):
+                                output = (output, )
+
+                            if subgraph_index < num_subgraphs - 1:
+                                activations.update(
+                                    batch_idx, {"positional_args": output},
+                                )
+                                # activations.delete(batch_idx)
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

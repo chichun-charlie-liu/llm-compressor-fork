@@ -11,7 +11,7 @@ from llmcompressor.utils import dispatch_for_generation
 
 """Please see details in `README_granite4.md`."""
 
-MODEL_ID = "ibm-granite/granite-4.0-tiny-preview"
+MODEL_ID = "ibm-granite/granite-4.0-h-tiny"
 
 # Load model.
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
@@ -44,24 +44,32 @@ recipe = QuantizationModifier(
 oneshot(model=model, recipe=recipe)
 
 # Confirm generations of the quantized model look sane.
-print("========== SAMPLE GENERATION ==============")
-dispatch_for_generation(model)
-input_ids = tokenizer(
-    "What is your favorite TV show?", return_tensors="pt"
-).input_ids.to("cuda")
-output = model.generate(input_ids, max_new_tokens=20)
-print(tokenizer.decode(output[0]))
-print("==========================================")
+# dispatch_for_generation(model)
+if all(p.device.type == "cuda" for p in model.parameters()):
+    print("========== SAMPLE GENERATION ==============")
+    input_ids = tokenizer(
+        "What is your favorite TV show?", return_tensors="pt"
+    ).input_ids.to(model.device)
+    output = model.generate(input_ids, max_new_tokens=20)
+    print(tokenizer.decode(output[0]))
+    print("==========================================")
+else:
+    print(
+        "Model is offloaded and will not run efficiently. Saved checkpoint will not be "
+        "affected but sample generation test is skipped for runtime reason."
+    )
 
 # Revert weights of MoE experts to 3D format (num_experts, output_size, input_size)
 for n, m in model.named_modules():
     if isinstance(m, GraniteMoeHybridParallelExpertsLinear):
+        m.to("cuda")
         # NOTE: can assert type != "meta" instead, which is sign of offloading
-        assert m.weight.device.type == "cuda", (
-            "Found some offloaded weights. This is not compatible with reshaping "
-            "experts to 3D prior model save. Ensure the model is fully on cuda."
-        )
+        # assert m.weight.device.type == "cuda", (
+        #     "Found some offloaded weights. This is not compatible with reshaping "
+        #     "experts to 3D prior model save. Ensure the model is fully on cuda."
+        # )
         m.to_3d_expert()
+        m.to("cpu")
 
 model.save_pretrained(SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)

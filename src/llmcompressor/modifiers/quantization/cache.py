@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from compressed_tensors.quantization.lifecycle import KVCacheScaleType
+from compressed_tensors.quantization.lifecycle.forward import quantize, dequantize
 from compressed_tensors.quantization.quant_args import QuantizationArgs
 from torch import Tensor
 from transformers import DynamicCache
@@ -206,3 +207,166 @@ def _pad_and_append_at_idx_(lst: List, idx: int, val: Any) -> list:
         lst += [None] * num_to_pad
     lst[idx] = val
     return lst
+
+
+class QuantizedSSMStateCache(DynamicCache):
+    """
+    **Background**
+    Llama invoked KV cache in forward() using cache.update(), such as
+    ```python
+        keys, values = self.k_proj(x), self.k_proj(x)
+        if past_key_values is not None:
+            keys, values = past_key_values.update(keys, values, idx, ...)
+    ```
+
+    main functions of QuantKVdynCache.update() are:
+        a) append observers if not exist
+        b) return dQ( Q(input_K, input_V) )
+        c) observers will be called in Q() and scale/zp will be updated
+    Basically, the original KVCache class overrides _q(), _deq(), and .update().
+    NOTE:
+    - During calibration, KV was not used and passed-in past_key_values should be None.
+      In order to trigger Q/dQ, calib pipeline registers a *fwd_pre_hook* to assign
+      past_key_values = QuantKVDynCache => the `if` condition will be True and .update
+      will be triggered. 
+    - K, V passed to .update() are the newly calculated from Linear k_proj and v_proj.
+    - QKVDynCache class does NOT store KV, only manipulate the cache and then return.
+    
+    **For ssm_states in mamba layer**
+    In order to trigger Q/dQ and run calibration for ssm_states in Granite, we need to:
+    1. Prepare a placeholder and pass it to fwd(cache_params=<our_placeholder>)
+    2. Make sure `use_precomputed_states` will be False in fwd(). => old states will not
+        participate in computation, only new states will be stored in the placeholder.
+    3. At the end of fwd(), freshly computed ssm_states will be write back to the
+        placeholder, we can calculate scales/zp then.
+    These will be done together with fwd_pre_hook and fwd_hook.
+
+    NOTE:
+    - This class doesn't inherit HybridMambaAttentionDynamicCache because that class
+      requires a more complicated init step which requires some additional args. As a
+      compromise, we will need to include a few dummy class properties to trick
+      downstream functions. 
+    - ssm_states will only be used during decoding stage. calibration is trying to use
+      prefill states, which is calculated without previous states, to estimate scales.  
+    - Quantization strategy (tensor, group, channel) set from QuantizationArgs.
+    - At decoding stage, ssm_states are mainly used in 2 calculations as below (i.e.
+      will not call cache.update() like Llama):
+        1) cache_params.ssm_states[idx].copy_(cache_params.ssm_states[idx] * dA + dBx)
+        2) y = torch.bmm(ssm_states.view(b*h, d, n), C_reshaped)
+      (An efficient fused kernel will try to avoid unnecessary memory access. As a
+      result, .copy_() in Step 1) may be skipped.)
+    - Triggered the quantization by adding ssm_state_scheme= in the recipe, such as:
+
+    ```python3
+    recipe = QuantizationModifier(
+        ...
+        ...,
+        ssm_state_scheme=QuantizationArgs(
+            num_bits=8,
+            type=QuantizationType.FLOAT,
+            strategy=QuantizationStrategy.TENSOR,
+            dynamic=False,
+            symmetric=True,
+        )
+    )
+    '''
+    """
+
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, *args, **kwargs):
+        """Singleton"""
+        if cls._instance is None:
+            cls._instance = super(QuantizedSSMStateCache, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, quantization_args: QuantizationArgs):
+        if not self._initialized:
+            super().__init__()
+
+            self.quantization_args = quantization_args
+            self.ssm_state_observers: List[Observer] = []
+            # each index corresponds to layer_idx of the attention layer
+            self.ssm_state_scales: List[Tensor] = []
+            self.ssm_state_zps: List[Tensor] = []
+
+            # ssm_states will be used to store new ssm_state at the end of each iter
+            # use dict to avoid padding for missing idx due to non-mamba layers
+            self.ssm_states: dict = {}
+            self.has_previous_state = False
+            self.conv_states: dict = {}
+
+            self._initialized = True
+
+
+    def update(
+        self,
+        ssm_states: Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Get the ssm_state_scale and output the fakequant-ed ssm_states"""
+
+        if len(self.ssm_state_observers) <= layer_idx:
+            ssm_state_observer_name = self.quantization_args.observer
+            ssm_state_observer = Observer.load_from_registry(
+                ssm_state_observer_name, quantization_args=self.quantization_args
+            )
+
+            # NOTE: Not all the layers will be using ssm_states, e.g. hybrid models, may
+            # need to pad the self.observers list
+            _pad_and_append_at_idx_(
+                self.ssm_state_observers, layer_idx, ssm_state_observer
+            )
+
+        q_ssm_states = self._quantize(ssm_states.contiguous(), layer_idx)
+
+        qdq_ssm_states = self._dequantize(q_ssm_states, layer_idx)
+
+        return qdq_ssm_states
+
+    def reset_states(self):
+        """reset the ssm states (used in calibration)"""
+        self.ssm_state_cache: List[Tensor] = []
+        # Used in `generate` to keep tally of how many tokens the cache has seen
+        self._seen_tokens = 0
+        self._quantized_ssm_state_cache: List[Tensor] = []
+
+    def reset(self):
+        """Reset the instantiation, create new instance on init"""
+        QuantizedSSMStateCache._instance = None
+        QuantizedSSMStateCache._initialized = False
+
+    def _quantize(self, tensor, layer_idx):
+        """Quantizes a key/value using a defined quantization method."""
+
+        observer = self.ssm_state_observers[layer_idx]
+        scales = self.ssm_state_scales
+        zps = self.ssm_state_zps
+
+        scale, zp = observer(tensor)
+        _pad_and_append_at_idx_(scales, layer_idx, scale)
+        _pad_and_append_at_idx_(zps, layer_idx, zp)
+
+        q_tensor = quantize(
+            x=tensor,
+            scale=scale,
+            zero_point=zp,
+            args=self.quantization_args,
+        )
+        return q_tensor
+
+    def _dequantize(self, qtensor, layer_idx):
+        """Dequantizes back the tensor that was quantized by `self._quantize()`"""
+
+        scale = self.ssm_state_scales[layer_idx]
+        zp = self.ssm_state_zps[layer_idx]
+
+        qdq_tensor = dequantize(
+            x_q=qtensor,
+            scale=scale,
+            zero_point=zp,
+            args=self.quantization_args,
+        )
+        return qdq_tensor

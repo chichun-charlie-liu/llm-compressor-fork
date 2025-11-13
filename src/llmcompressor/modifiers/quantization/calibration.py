@@ -14,7 +14,10 @@ from compressed_tensors.utils import align_module_device, update_offload_paramet
 from loguru import logger
 from torch.nn import Module
 
-from llmcompressor.modifiers.quantization.cache import QuantizedKVParameterCache
+from llmcompressor.modifiers.quantization.cache import (
+    QuantizedKVParameterCache,
+    QuantizedSSMStateCache,
+)
 from llmcompressor.observers import Observer
 from llmcompressor.utils.helpers import getattr_chain
 
@@ -328,3 +331,86 @@ def reset_quantization_status(model: Module):
     for module in model.modules():
         if hasattr(module, "quantization_status"):
             delattr(module, "quantization_status")
+
+
+def calibrate_ssm_state_input_hook(
+    module: Module, args: Any, kwargs: Dict[str, Any]
+) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """
+    Two important tasks for this hook:
+    1. inputs to granite decoder, i.e. `hidden_states`, are placed in kwargs instead of
+       positional args. we need to pop `hidden_states` from kwargs into args, otherwise
+       downstream func in llm-compressor pipeline will not work properly.
+    2. initialize the placeholder QuantizedSSMStateCache.ssm_states[idx], which will not
+       participate in computation during prefill but will be overwritten at the end of
+       forward() so that scales/zps can be calculated in the other hook. 
+    """
+    if "hidden_states" in kwargs:
+        args = (kwargs.pop("hidden_states"), )
+
+    ssm_state_cache = module.ssm_state_cache
+    layer_idx = module.layer_idx
+    if layer_idx not in ssm_state_cache.ssm_states:
+        cfg = module.model_cfg
+
+        ssm_state_cache.ssm_states[layer_idx] = torch.zeros(
+            [args[0].shape[0], cfg.mamba_n_heads, cfg.mamba_d_head, cfg.mamba_d_state],
+            dtype=args[0].dtype,
+            device=args[0].device,
+        )
+        conv_state_shape = [
+            args[0].shape[0],
+            (cfg.mamba_expand * cfg.hidden_size + 2 * cfg.mamba_n_groups * cfg.mamba_d_state),
+            cfg.mamba_d_conv,
+        ]
+        ssm_state_cache.conv_states[layer_idx] = torch.zeros(
+            conv_state_shape,
+            dtype=args[0].dtype,
+            device=args[0].device,
+        )
+
+    kwargs["cache_params"] = ssm_state_cache
+    kwargs["use_cache"] = False
+
+    return args, kwargs
+
+
+def calibrate_ssm_state_output_hook(
+    module: Module, _args: Any, kwargs: Dict[str, Any], _output: torch.Tensor
+):
+    """
+    New ssm_states is stored in ssm_state_cache.ssm_states[idx] now, need to run Q/dQ to
+    update scales and zps.
+    """
+    ssm_state_cache = module.ssm_state_cache
+    ssm_state_i = ssm_state_cache.ssm_states[module.layer_idx]
+    ssm_state_cache.update(ssm_state_i, module.layer_idx)  # Q/dQ states won't be needed
+    update_offload_parameter(module, "ssm_state_scale", 
+                             ssm_state_cache.ssm_state_scales)
+
+
+def initialize_quantized_ssm_state_cache(module: Module):
+    """
+    Initialize a quantized ssm_state_cache on a module (analogous to initializing an
+    observer) When a config specifying ssm_state_scheme quantization is applied to a
+    model, the ssm_state_scheme args are redefined as the output_activations targeting
+    mamba modules.
+
+    This function should be called on mamba modules with output_activations
+    Copied and modified from init_quant_kv_cache().
+    """
+    scheme: Optional[QuantizationScheme] = getattr(module, "quantization_scheme", None)
+    existing_ssm_state_cache = getattr(module, "ssm_state_cache", None)
+
+    if (
+        scheme is None
+        or not "mamba" in scheme.targets[0]
+        or isinstance(existing_ssm_state_cache, QuantizedSSMStateCache)
+    ):
+        return
+
+    setattr(
+        module,
+        "ssm_state_cache",
+        QuantizedSSMStateCache(scheme.output_activations)
+    )

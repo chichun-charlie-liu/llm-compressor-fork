@@ -2,7 +2,9 @@ import contextlib
 import inspect
 from collections import deque
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from tqdm import tqdm
 
 import torch
 from accelerate.hooks import remove_hook_from_module
@@ -152,6 +154,96 @@ def trace_subgraphs(
         )
 
     return subgraphs
+
+
+class cache_block0_pre_fwd_hook:
+    """Hook used by Block0 caching. Will be used as a pre-forward hook."""
+    def __init__(self, cache):
+        self.cache = cache
+        self.batch_id = 0
+
+    def __call__(self, _mod, args, kwargs):
+        kwargs["positional_args"] = args  # could be empty tuple
+        self.cache.update(self.batch_id, kwargs)
+        self.batch_id += 1
+        raise ValueError
+
+
+def cache_block0(model, block0, cache):
+    h_hook = block0.register_forward_pre_hook(
+        cache_block0_pre_fwd_hook(cache),
+        with_kwargs=True
+    )
+    block0_desc = f"Preparing cache to block 0"
+    for batch_idx in tqdm(range(len(cache)), desc=block0_desc):
+        inputs = cache.fetch(batch_idx)
+        try:
+            model(**inputs)
+        except ValueError:
+            pass
+    h_hook.remove()
+
+
+def fake_trace(
+    model: PreTrainedModel,
+    sample_input: Dict[str, Any],
+    sequential_targets: List[str],
+) -> List[str]:
+    """
+    For the simplest model, i.e. transformers with stacked decoders, where
+     1. model.fwd() basically loops through each decoder block and
+     2. output of the previous decoder block is the input of the next blcok
+    a full model tracing may not be needed.
+    We will use a simple hook to double check the seq_target, call sequence, and shapes
+    of input/output tensors.
+    Final return is a list of module names (str) in the same order of them being called
+    during forward.
+    NOTE: A full model tracing can still be done with torch._dynamo and will be more
+    generic. But it will need some additional works compared to this simple alternative.
+    """
+    if isinstance(sequential_targets, str):
+        sequential_targets = [sequential_targets]
+    if len(sequential_targets) > 1:
+        raise NotImplementedError("only support one sequential target for now.")
+
+    h_hooks = []
+    input_shape = []
+    output_shape = []
+    mod_type_seen = set()
+    mod_call_seq = []
+    def call_seq_hook(mod, args, output, mod_name=None):
+        if mod_name is None:
+            raise RuntimeError("Cannot determine module name, please check seq_target.")
+
+        input_shape.append(args[0].shape)
+        output_shape.append(
+            output[0].shape if isinstance(output, tuple) else output.shape
+        )
+        if len(output_shape) > 1:
+            assert input_shape[-1] == output_shape[-2], "input/output shape mismatch."
+
+        if type(mod) not in mod_type_seen:
+            mod_type_seen.add(type(mod))
+
+        mod_call_seq.append(mod_name)
+
+    for name, m in model.named_modules():
+        if sequential_targets[0] in m.__class__.__name__:
+            h_hooks.append(
+                m.register_forward_hook(
+                    partial(call_seq_hook, mod_name=name),
+                )
+            )
+
+    with torch.no_grad():
+        model(**sample_input)
+
+    assert len(mod_type_seen) == 1, "Found more than 1 block type during fake tracing."
+
+    for h in h_hooks:
+        h.remove()
+
+    return mod_call_seq
 
 
 class SequentialTracer(HFTracer):
