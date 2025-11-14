@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from llmcompressor.core import LifecycleCallbacks, active_session
 from llmcompressor.modeling.prepare import moe_calibration_context
+from llmcompressor.modifiers.quantization.calibration import granite_inputs_patch_hook
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
@@ -162,6 +163,7 @@ class SequentialPipelineNoTrace(CalibrationPipeline):
         sample_input = next(iter(dataloader))
         subgraphs = fake_trace(model, sample_input, sequential_targets)
         num_subgraphs = len(subgraphs)
+        is_granite = "granite" in model.config.model_type
 
         LifecycleCallbacks.calibration_epoch_start()
 
@@ -187,7 +189,24 @@ class SequentialPipelineNoTrace(CalibrationPipeline):
             cache_block0(model, block0, activations)
 
             for subgraph_index, subgraph_name in enumerate(subgraphs):
-                subgraph = model.get_submodule(subgraph_name)
+                subgraph = model.get_submodule(subgraph_name)  # it's a decoder block
+
+                # Granite family handles inputs to decoder blocks differently from
+                # typical HF models. Need to attach a "patch hook" to those we plan to
+                # quantize to ensure compatibility with llm-compressor functions.
+                # NOTE Leave these hooks in place so that final ckpt saving could work.
+                # Attach hook handles to model so that we could remove them if needed.
+                h_hooks_granite_patch = []
+                for m in subgraph.modules():
+                    if is_granite and hasattr(m, "quantization_scheme"):
+                        h_hooks_granite_patch.append(
+                            m.register_forward_pre_hook(
+                                granite_inputs_patch_hook,
+                                with_kwargs=True,
+                                prepend=True,
+                            )
+                        )
+
                 # prepare tqdm description texts
                 calib_desc = f"({subgraph_index + 1}/{num_subgraphs}): Calibrating"
                 prop_desc = f"({subgraph_index + 1}/{num_subgraphs}): Propagating"
@@ -212,11 +231,13 @@ class SequentialPipelineNoTrace(CalibrationPipeline):
                             if not isinstance(output, tuple):
                                 output = (output, )
 
+                            # use current output as the input for next decoder
                             if subgraph_index < num_subgraphs - 1:
                                 activations.update(
                                     batch_idx, {"positional_args": output},
                                 )
-                                # activations.delete(batch_idx)
+
+            model.h_hooks_granite_patch = h_hooks_granite_patch
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

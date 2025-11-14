@@ -333,44 +333,57 @@ def reset_quantization_status(model: Module):
             delattr(module, "quantization_status")
 
 
-def calibrate_ssm_state_input_hook(
+def granite_inputs_patch_hook(
     module: Module, args: Any, kwargs: Dict[str, Any]
 ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
     """
-    Two important tasks for this hook:
-    1. inputs to granite decoder, i.e. `hidden_states`, are placed in kwargs instead of
-       positional args. we need to pop `hidden_states` from kwargs into args, otherwise
-       downstream func in llm-compressor pipeline will not work properly.
-    2. initialize the placeholder QuantizedSSMStateCache.ssm_states[idx], which will not
-       participate in computation during prefill but will be overwritten at the end of
-       forward() so that scales/zps can be calculated in the other hook. 
+    Due to design choice, inputs to granite decoder, i.e. `hidden_states`, are placed in
+    kwargs instead of positional args. To make it compatible with downstream functions
+    in llm-compressor pipeline, we need to pop `hidden_states` from kwargs into args so
+    that the decoders will behave like those in typical HF models.
+    NOTE This hook needs be attached before ssm_state_input_hook and needs to stay
+    active through out the entire calibration process.
     """
     if "hidden_states" in kwargs:
         args = (kwargs.pop("hidden_states"), )
 
+    return args, kwargs
+
+
+def calibrate_ssm_state_input_hook(
+    module: Module, args: Any, kwargs: Dict[str, Any]
+) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """
+    This hook initialize the placeholders in QuantizedSSMStateCache, i.e. .ssm_states
+    and .conv_states, which will hold the newly calculated states during prefill (calib)
+    stage so that scales/zps can be calculated later in the other hook.
+    """
     ssm_state_cache = module.ssm_state_cache
     layer_idx = module.layer_idx
+    assert len(args) > 0, "Please use granite_inputs_patch_hook properly."
+    inputs = args[0]
+
     if layer_idx not in ssm_state_cache.ssm_states:
         cfg = module.model_cfg
 
         ssm_state_cache.ssm_states[layer_idx] = torch.zeros(
-            [args[0].shape[0], cfg.mamba_n_heads, cfg.mamba_d_head, cfg.mamba_d_state],
-            dtype=args[0].dtype,
-            device=args[0].device,
+            [inputs.shape[0], cfg.mamba_n_heads, cfg.mamba_d_head, cfg.mamba_d_state],
+            dtype=inputs.dtype,
+            device=inputs.device,
         )
         conv_state_shape = [
-            args[0].shape[0],
+            inputs.shape[0],
             (cfg.mamba_expand * cfg.hidden_size + 2 * cfg.mamba_n_groups * cfg.mamba_d_state),
             cfg.mamba_d_conv,
         ]
         ssm_state_cache.conv_states[layer_idx] = torch.zeros(
             conv_state_shape,
-            dtype=args[0].dtype,
-            device=args[0].device,
+            dtype=inputs.dtype,
+            device=inputs.device,
         )
 
     kwargs["cache_params"] = ssm_state_cache
-    kwargs["use_cache"] = False
+    # kwargs["use_cache"] = False  # not being used to control cache usage in this case.
 
     return args, kwargs
 
@@ -380,13 +393,14 @@ def calibrate_ssm_state_output_hook(
 ):
     """
     New ssm_states is stored in ssm_state_cache.ssm_states[idx] now, need to run Q/dQ to
-    update scales and zps.
+    recalc scales and zps and then update the param attached to the module.
     """
+    lay_idx = module.layer_idx
     ssm_state_cache = module.ssm_state_cache
-    ssm_state_i = ssm_state_cache.ssm_states[module.layer_idx]
-    ssm_state_cache.update(ssm_state_i, module.layer_idx)  # Q/dQ states won't be needed
+    ssm_state_i = ssm_state_cache.ssm_states[lay_idx]
+    ssm_state_cache.update(ssm_state_i, lay_idx)  # returned Q/dQ states won't be needed
     update_offload_parameter(module, "ssm_state_scale", 
-                             ssm_state_cache.ssm_state_scales)
+                             ssm_state_cache.ssm_state_scales[lay_idx])
 
 
 def initialize_quantized_ssm_state_cache(module: Module):
