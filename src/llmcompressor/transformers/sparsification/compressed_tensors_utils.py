@@ -29,6 +29,38 @@ from llmcompressor.transformers.utils.helpers import infer_recipe_from_model_pat
 __all__ = ["modify_save_pretrained", "untie_word_embeddings"]
 
 
+def mend_quant_config_for_ssm_states(compressor: ModelCompressor):
+    """
+    Original design is to reconstruct and mend quantization_config through
+    QuantizationConfig.from_pretrained(), which is called in get_model_compressor() ->
+    ModelCompressor.from_pretrained_model(), and then attach quant_cfg to compressor.
+
+    In this process, kv_cache_scheme, if exists in quant_cfg.config_groups[], will be
+    popped from that dict and then reattached as quant_cfg.kv_cache_scheme. We will do
+    the same to ssm_state_scheme here.
+
+    NOTE We could update QuantizationConfig.from_pretrained() instead, but feels cleaner
+    to do it here explicitly.
+    """
+    if not hasattr(compressor, "quantization_config"):
+        return
+
+    qcfg = compressor.quantization_config
+    qcfg_ctrl_grps = qcfg.config_groups
+    grp_to_pop = [grp_name for grp_name, grp in qcfg_ctrl_grps.items()
+                  if any("mamba" in gt for gt in grp.targets)]
+    if len(grp_to_pop) > 1:
+        raise ValueError(
+            "More than one group in config_groups is targeting mamba layers."
+            f" Please double check settings. {qcfg_ctrl_grps}"
+        )
+    elif len(grp_to_pop) == 1:
+        # pydantic may prohibit setting new attr in QuantConfig obj directly.
+        # use __dict__ as a workaround
+        qcfg.__dict__["ssm_state_scheme"] = qcfg_ctrl_grps.pop(grp_to_pop[0])
+    # no action needed if len() == 0
+
+
 def modify_save_pretrained(model: PreTrainedModel):
     """
     Overrides a PreTrainedModel's save_pretrained() method with a wrapped version that
@@ -92,6 +124,7 @@ def modify_save_pretrained(model: PreTrainedModel):
                 disable_sparse_compression=disable_sparse_compression,
             )
             if compressor is not None:
+                mend_quant_config_for_ssm_states(compressor)
                 compressor.compress_model(model)
 
             # save (compressed) model structure

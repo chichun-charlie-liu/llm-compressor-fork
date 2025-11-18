@@ -7,6 +7,7 @@ from compressed_tensors.quantization import (
     QuantizationConfig,
     QuantizationScheme,
     QuantizationStatus,
+    QuantizationStrategy,
     apply_quantization_config,
     disable_quantization,
     enable_quantization,
@@ -231,15 +232,19 @@ class QuantizationMixin(HooksMixin):
         quantization. For simplicity and clarity, we chose not to modify/add codes in
         compressed_tensors but collect all needed codes here.
         """
-        if self.ssm_state_scheme is None:
+        quant_args = self.ssm_state_scheme
+        mod_cfg = model.config
+        if quant_args is None:
             return
 
         # mimic process_kv_cache_config()
-        if isinstance(self.ssm_state_scheme, QuantizationArgs):
+        if isinstance(quant_args, QuantizationArgs):
             scheme = QuantizationScheme(
-                output_activations=self.ssm_state_scheme, targets=["re:.*mamba$"],
+                output_activations=quant_args, targets=["re:.*mamba$"],
             )
-            config.config_groups["ssm_state"] = scheme
+            # Instead of modifying QuantizationConfig class, we could directly add new
+            # attributes this way
+            config.__dict__["ssm_state_scheme"] = quant_args
         else:
             # TODO enable yaml/text-style recipe in the future.
             raise ValueError("ssm_state `scheme` must be QuantizationArgs")
@@ -248,16 +253,30 @@ class QuantizationMixin(HooksMixin):
         # identify target modules based on scheme, init the modules by adding _scale,
         # _zp, or kv_scales (as Parameters). Here we only need ssm_state_scale, similar
         # to _initialize_attn_scales(). And then attach quant_scheme and quant_status.
-        targets = config.config_groups["ssm_state"].targets
         for _name, submodule in match_named_modules(
-            model, targets, config.ignore, warn_on_fail=True
+            model, scheme.targets, config.ignore, warn_on_fail=True
             ):
 
             param = next(submodule.parameters())
             dtype = param.dtype
             device = param.device
 
-            expected_shape = 1  # TODO, need to infer from qscheme and enhance quantizer
+            if quant_args.strategy == QuantizationStrategy.TENSOR:
+                expected_shape = 1
+            elif quant_args.strategy == QuantizationStrategy.GROUP:
+                # states.shape = [bs, num_head, head_dim, state_dim], we will reshape to
+                # [bs, num_groups, group_size] and reduce dim 0 and 2.
+                total_state_elem = (
+                    mod_cfg.mamba_n_heads * mod_cfg.mamba_d_head * mod_cfg.mamba_d_state
+                )
+                num_groups = total_state_elem // quant_args.group_size
+                expected_shape = [1, num_groups, 1]
+            else:
+                raise ValueError(
+                    "Only TENSOR and GROUP strategy are supported for ssm_state"
+                    f" quantization but {quant_args.strategy} is selected."
+                )
+
             init_scale = torch.nn.Parameter(
                 torch.empty(expected_shape, dtype=dtype, device=device),
                 requires_grad=False,
@@ -269,14 +288,9 @@ class QuantizationMixin(HooksMixin):
 
             # NOTE Because our ssm_state hooks are meant to collect scale statistics of
             # prefill states, they are triggered AFTER all the ssm_state computation.
-            # Wrap forward will not affect anything but only cause false error.
-
-            # with disable_hf_hook(submodule):
-            #     # wrap forward call of module to perform
-            #     # quantized actions based on calltime status
-            #     wrap_module_forward_quantized(submodule, scheme)
-
-        return
+            # Applying wrap_module_forward_quantized() will not affect anything but
+            # cause false error. Need to use vllm to verify the fp8 ssm_states, same as
+            # kv cache compression.
 
     def _initialize_observers(self, module: torch.nn.Module):
         if not hasattr(module, "quantization_scheme"):

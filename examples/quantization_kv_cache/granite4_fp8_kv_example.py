@@ -13,7 +13,6 @@ from llmcompressor.utils import dispatch_for_generation
 
 # Select model and load it.
 MODEL_ID = "ibm-granite/granite-4.0-h-tiny"
-# MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -52,7 +51,7 @@ ds = ds.map(process_and_tokenize, remove_columns=ds.column_names)
 #   * quantize the kv cache to fp8 with per-tensor scales
 #   ** quantize the SSM_STATE cache to fp8 with per-tensor scales
 #   NOTE quantization target for ssm_state is hard-coded as "re:.*mamba$" for now, see
-#       QuantizationMixin.resolve_quantization_config(), follow kv cache approach.
+#       QuantizationMixin.resolve_and_apply_ssm_state_quant_config().
 recipe = QuantizationModifier(
     targets=["Linear"],
     scheme="FP8_DYNAMIC",
@@ -67,7 +66,8 @@ recipe = QuantizationModifier(
     ssm_state_scheme=QuantizationArgs(
         num_bits=8,
         type=QuantizationType.FLOAT,
-        strategy=QuantizationStrategy.TENSOR,
+        strategy=QuantizationStrategy.TENSOR,  # GROUP
+        # group_size=128,
         dynamic=False,
         symmetric=True,
     )
@@ -102,5 +102,7 @@ print("==========================================\n\n")
 
 # Save to disk compressed.
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-FP8-KV"
+if recipe.ssm_state_scheme is not None:
+    SAVE_DIR += f"-ssm-{recipe.ssm_state_scheme.strategy}"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)

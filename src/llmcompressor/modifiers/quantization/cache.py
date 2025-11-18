@@ -2,7 +2,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from compressed_tensors.quantization.lifecycle import KVCacheScaleType
 from compressed_tensors.quantization.lifecycle.forward import quantize, dequantize
-from compressed_tensors.quantization.quant_args import QuantizationArgs
+from compressed_tensors.quantization.quant_args import (
+    QuantizationArgs,
+    QuantizationStrategy,
+)
 from torch import Tensor
 from transformers import DynamicCache
 
@@ -324,7 +327,7 @@ class QuantizedSSMStateCache(DynamicCache):
 
         qdq_ssm_states = self._dequantize(q_ssm_states, layer_idx)
 
-        return qdq_ssm_states
+        return qdq_ssm_states.view(self.org_shape)
 
     def reset_states(self):
         """reset the ssm states (used in calibration)"""
@@ -339,13 +342,32 @@ class QuantizedSSMStateCache(DynamicCache):
         QuantizedSSMStateCache._initialized = False
 
     def _quantize(self, tensor, layer_idx):
-        """Quantizes a key/value using a defined quantization method."""
+        """
+        Quantize the input ssm_state tensor and update self.scales and zp.
+        Because ssm_state.shape = [batch, num_head, head_dim, state_dim], may need to
+        reshape to 2D or 3D if using strategies other than per-tensor.
+        """
 
         observer = self.ssm_state_observers[layer_idx]
         scales = self.ssm_state_scales
         zps = self.ssm_state_zps
+        self.org_shape = tensor.shape
 
-        scale, zp = observer(tensor)
+        if self.quantization_args.strategy == QuantizationStrategy.TENSOR:
+            scale, zp = observer(tensor)
+
+        elif self.quantization_args.strategy == QuantizationStrategy.GROUP:
+            # reshape from [batch, num_head, head_dim, state_dim] to [b, n_grps, grp_sz]
+            # where num_groups = num_head * head_dim * state_dim / grp_size
+            # reduce_dim= 0, 2 -> scale.shape = [1, n_grps, 1]
+            grp_size = self.quantization_args.group_size
+            tensor = tensor.view([tensor.shape[0], -1, grp_size])
+            scale, zp = observer.get_qparams_along_dim(tensor, dim=1)  # ie, KEEP dim 1
+        else:
+            raise ValueError(
+                f"Strategy {self.quantization_args.strategy} is not supported "
+                "for ssm_state quantization. Only TENSOR or GROUP is allowed."
+            )
         _pad_and_append_at_idx_(scales, layer_idx, scale)
         _pad_and_append_at_idx_(zps, layer_idx, zp)
 
@@ -355,6 +377,7 @@ class QuantizedSSMStateCache(DynamicCache):
             zero_point=zp,
             args=self.quantization_args,
         )
+        # remember q_tensor is still of shape [b, n_grps, grp_sz], reshape after dequant
         return q_tensor
 
     def _dequantize(self, qtensor, layer_idx):

@@ -191,21 +191,10 @@ class SequentialPipelineNoTrace(CalibrationPipeline):
             for subgraph_index, subgraph_name in enumerate(subgraphs):
                 subgraph = model.get_submodule(subgraph_name)  # it's a decoder block
 
-                # Granite family handles inputs to decoder blocks differently from
-                # typical HF models. Need to attach a "patch hook" to those we plan to
-                # quantize to ensure compatibility with llm-compressor functions.
-                # NOTE Leave these hooks in place so that final ckpt saving could work.
-                # Attach hook handles to model so that we could remove them if needed.
-                h_hooks_granite_patch = []
-                for m in subgraph.modules():
-                    if is_granite and hasattr(m, "quantization_scheme"):
-                        h_hooks_granite_patch.append(
-                            m.register_forward_pre_hook(
-                                granite_inputs_patch_hook,
-                                with_kwargs=True,
-                                prepend=True,
-                            )
-                        )
+                # NOTE Granite family handles inputs to decoder blocks differently from
+                # typical HF models. In some cases we may need to attach a "patch hook"
+                # to those we plan to quantize to ensure compatibility.
+                # Leave these hooks in place so that final ckpt saving could work.
 
                 # prepare tqdm description texts
                 calib_desc = f"({subgraph_index + 1}/{num_subgraphs}): Calibrating"
@@ -237,7 +226,6 @@ class SequentialPipelineNoTrace(CalibrationPipeline):
                                     batch_idx, {"positional_args": output},
                                 )
 
-            model.h_hooks_granite_patch = h_hooks_granite_patch
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

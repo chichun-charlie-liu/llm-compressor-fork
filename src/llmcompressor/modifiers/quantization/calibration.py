@@ -338,11 +338,12 @@ def granite_inputs_patch_hook(
 ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
     """
     Due to design choice, inputs to granite decoder, i.e. `hidden_states`, are placed in
-    kwargs instead of positional args. To make it compatible with downstream functions
-    in llm-compressor pipeline, we need to pop `hidden_states` from kwargs into args so
-    that the decoders will behave like those in typical HF models.
-    NOTE This hook needs be attached before ssm_state_input_hook and needs to stay
-    active through out the entire calibration process.
+    kwargs instead of positional args. If any downstream functions can only recognize
+    positional args, we may use this hook to patch the modules needed. It simply pops
+    `hidden_states` from kwargs into args to make the module behaves like those in
+    typical HF models.
+    NOTE This hook will need to be attached before all other input hooks and stay active
+    through out the entire calibration process.
     """
     if "hidden_states" in kwargs:
         args = (kwargs.pop("hidden_states"), )
@@ -360,8 +361,8 @@ def calibrate_ssm_state_input_hook(
     """
     ssm_state_cache = module.ssm_state_cache
     layer_idx = module.layer_idx
-    assert len(args) > 0, "Please use granite_inputs_patch_hook properly."
-    inputs = args[0]
+    inputs = args[0] if len(args) > 0 else kwargs["hidden_states"] 
+    # Or use granite_inputs_patch_hook properly to patch the entire model.
 
     if layer_idx not in ssm_state_cache.ssm_states:
         cfg = module.model_cfg
