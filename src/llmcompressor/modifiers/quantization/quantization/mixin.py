@@ -29,6 +29,7 @@ from llmcompressor.modifiers.quantization.calibration import (
     calibrate_output_hook,
     calibrate_query_hook,
     calibrate_value_hook,
+    calibrate_ssm_state_output_hook,
     freeze_module_quantization,
     initialize_observer,
     reset_quantization_status,
@@ -90,6 +91,9 @@ class QuantizationMixin(HooksMixin):
         There is an explicit assumption that the model contains modules with
         `k_proj` and `v_proj` in their names. If this is not the case
         and kv_cache_scheme != None, the quantization of kv cache will fail
+    :param ssm_state_scheme: optional QuantizationArgs, ssm_states are similar to kv
+        cache but used in state-space models like mamba or transformer/mamba hybrid.
+        Assuming target layers are named as "re:.*mamba$".
     """
 
     config_groups: Optional[Dict[str, QuantizationScheme]] = None
@@ -100,6 +104,7 @@ class QuantizationMixin(HooksMixin):
     ignore: List[str] = Field(default_factory=list)
     scheme: Optional[Union[str, Dict[str, Any]]] = None
     kv_cache_scheme: Optional[QuantizationArgs] = None
+    ssm_state_scheme: Optional[QuantizationArgs] = None
 
     _calibration_hooks: Set[RemovableHandle] = PrivateAttr(default_factory=set)
     _resolved_config: Optional[QuantizationConfig] = PrivateAttr(None)
@@ -156,6 +161,9 @@ class QuantizationMixin(HooksMixin):
         if self.resolved_config.kv_cache_scheme is not None:
             # TODO: decouple reliance on this regex for matching attention
             targets.add("re:.*self_attn$")
+
+        if self.resolved_config.ssm_state_scheme is not None:
+            targets.add("re:.*mamba$")
 
         return targets
 
@@ -228,6 +236,7 @@ class QuantizationMixin(HooksMixin):
         targets = self.targets
         config_groups = self.config_groups
         kv_cache_scheme = self.kv_cache_scheme
+        ssm_state_scheme = self.ssm_state_scheme
         ignore = self.ignore
 
         if scheme is not None and config_groups is not None:
@@ -259,6 +268,7 @@ class QuantizationMixin(HooksMixin):
         return QuantizationConfig(
             config_groups=config_groups,
             kv_cache_scheme=kv_cache_scheme,
+            ssm_state_scheme=ssm_state_scheme,
             quantization_status=QuantizationStatus.INITIALIZED,
             ignore=ignore,
         )
@@ -275,10 +285,13 @@ class QuantizationMixin(HooksMixin):
         weight = scheme.weights is not None
         output = scheme.output_activations and not scheme.output_activations.dynamic
         is_attention = is_attention_module(module)
+        is_mamba = "mamba" in scheme.targets[0] if input else False
 
         # input activations
         if input:
-            if not is_attention:
+            if is_mamba:
+                initialize_observer(module, base_name="ssm_state")
+            elif not is_attention:
                 initialize_observer(module, base_name="input")
             else:
                 if hasattr(module, IMPL_ATTR):
@@ -307,10 +320,17 @@ class QuantizationMixin(HooksMixin):
         )
         output = scheme.output_activations and not scheme.output_activations.dynamic
         is_attention = is_attention_module(module)
+        is_mamba = "mamba" in scheme.targets[0] if input else False
 
         # input activations
         if input:
-            if not is_attention:
+            if is_mamba:
+                hooks.add(
+                    self.register_hook(
+                        module, calibrate_ssm_state_output_hook, "forward"
+                    )
+                )
+            elif not is_attention:
                 hooks.add(
                     self.register_hook(module, calibrate_input_hook, "forward_pre")
                 )

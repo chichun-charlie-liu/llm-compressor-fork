@@ -45,6 +45,8 @@ def flatten_for_calibration(
         return _flatten_activation(value, args)
     elif base_name in ("q", "k", "v"):
         return _flatten_attention(value, args)
+    elif base_name in ("ssm_state"):
+        return _flatten_ssm_state(value, args)
     else:
         raise ValueError(f"Unknown quantization base name: {base_name}")
 
@@ -142,5 +144,28 @@ def _flatten_attention(value: torch.Tensor, args: QuantizationArgs):
     if args.strategy == QuantizationStrategy.ATTN_HEAD:
         # (batch_size * seq_len, num_heads, 1, 1, head_dim)
         return value.transpose(1, 2).flatten(0, 1).unsqueeze(-2).unsqueeze(-2)
+
+    assert False, f"Unknown strategy {args.strategy}"
+
+
+def _flatten_ssm_state(value: torch.Tensor, args: QuantizationArgs):
+    # value.shape = (batch_size, num_heads, head_dim, state_dim), will reduce (0, -2) so
+    # target shape is `(num_observations, num_group, group_size)` 
+
+
+    if args.strategy == QuantizationStrategy.TENSOR:
+        # (batch_size, 1, num_heads* head_dim* state_dim)
+        return value.view(1, 1,-1)
+
+    if args.strategy == QuantizationStrategy.GROUP:
+        return value.view(value.shape[0], -1, args.group_size)
+
+    if args.strategy in (
+        QuantizationStrategy.TENSOR_GROUP,
+        QuantizationStrategy.TOKEN,
+        QuantizationStrategy.CHANNEL,
+        QuantizationStrategy.BLOCK
+    ):
+        raise ValueError(f"{args.strategy} quantization strategy is not support.")
 
     assert False, f"Unknown strategy {args.strategy}"

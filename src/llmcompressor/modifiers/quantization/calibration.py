@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from compressed_tensors.quantization import (
@@ -209,6 +209,17 @@ def calibrate_key_hook(module: Module, key_states: torch.Tensor):
 
 def calibrate_value_hook(module: Module, value_states: torch.Tensor):
     calibrate_activations(module, value_states, base_name="v")
+
+
+def calibrate_ssm_state_output_hook(module: Module, _args: Any, _output: torch.Tensor):
+    """
+    Cache module is shared among all the mamba layers and hold all the states, hence,
+    after mamba.fwd(), new ssm_states will be stored in .ssm_state_cache.ssm_states[idx]
+    After calib_act -> call_observer(), resulting scales will be stored in each layer.
+    """
+    lay_idx = module.layer_idx
+    ssm_state_i = module.ssm_state_cache.ssm_states[lay_idx]
+    calibrate_activations(module, value=ssm_state_i, base_name="ssm_state")
 
 
 def apply_calibration_status(module: Module):
